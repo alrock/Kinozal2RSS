@@ -6,6 +6,7 @@ import urllib
 import mechanize
 import codecs
 import os
+import datetime
 from configure import *
 
 class GrabberException:
@@ -14,19 +15,44 @@ class GrabberException:
         
     def str(self):
         return self.message
+        
+def datetime_convert(s):
+	#r'(?P<day>[0-9]{2}) (?P<month>[^ ]*) (?P<year>[0-9]{4}) в (?P<hour>[0-9]{2}):(?P<minutes>[0-9]{2})'
+    #r'(?P<when>^сегодня|^завтра|^вчера) в (?P<hour>[0-9]{2}):(?P<minutes>[0-9]{2})'
+    
+    when = {'сегодня': 0, 'завтра': 1, 'вчера': -1}
+    month = {'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 
+             'июня': 6, 'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 
+             'ноября': 11, 'декабря': 12}
+    
+    m1 = re.search(r'(?P<when>^сегодня|^завтра|^вчера) в (?P<hour>[0-9]{2}):(?P<minutes>[0-9]{2})', s.encode('utf-8'))
+    m2 = re.search(r'(?P<day>[0-9]{2}) (?P<month>[^ ]*) (?P<year>[0-9]{4}) в (?P<hour>[0-9]{2}):(?P<minutes>[0-9]{2})', s.encode('utf-8'))
+    
+    current_time = datetime.datetime.now()
+    
+    if m1:
+    	current_time = current_time.replace(hour=int(m1.group('hour')), minute=int(m1.group('minutes')))
+    	current_time += datetime.timedelta(days=when[m1.group('when')])
+    elif m2:
+    	current_time = datetime.datetime(day=int(m2.group('day')), month=int(month[m2.group('month')]), year=int(m2.group('year')), 
+    	                                 hour=int(m2.group('hour')), minute=int(m2.group('minutes')))
+    	                                 
+    return current_time
 
 class Grabber:
     
     def __init__(self):
-        self.coocies = None
+        self.cookies = None
         self.opener = None
 
     def __create_opener(self, cookies_file):
         try:
-            file = open(cookies_file, 'w')
+            file = open(cookies_file, 'a')
         except IOError as e:
             print e
             return None
+        finally:
+        	file.close()
         
         # Активируем обработку cookies
         self.cookies = mechanize.MozillaCookieJar(filename = cookies_file)
@@ -45,24 +71,36 @@ class Grabber:
         Устанавливает соединение с кинозалом и вытягивает страницу поиска, соотв.
         переданному в query (копия base_query) запросу
         """
-        if not self.__create_opener(os.path.join(cookies_path, 'cookies.txt')):
+        if not self.opener and not self.__create_opener(os.path.join(cookies_path, 'cookies.txt')):
             raise GrabberException("Error 1. Can't create/open cookies file.")
         
+       
+        tmp = [( k, v.decode('utf-8').encode('1251') ) for k,v in query.items()]
+        q = '?' + urllib.urlencode(tmp)
+        
+        resp = self.opener.open(search_url+q)
+        data = resp.read()
+        print >> open(query['s']+'.html', 'w'), data
+        #resp = self.opener.open(login_url) 
         # Проверяем корректность кук (весьма извращенным способом)
-        resp = self.opener.open(login_url)
-        if not re.search(r'/browse.php', resp.read()):
+        if not re.search(r'/browse\.php', data):
             # Я почти гарантирую что мы не залогинились
             print 'Take login again ...'
             self.opener.open(login_url, urllib.urlencode({'username': username, 
                                                      'password':password}))
             self.cookies.save()
+            
+            resp = self.opener.open(search_url+q)
+            data = resp.read()
+            if not re.search(r'/browse.php', data):
+            	raise GrabberException("Error 2. Oh no! I'm a robot!")
         
-        tmp = [( k, v.decode('utf-8').encode('1251') ) for k,v in query.items()]
-        q = '?' + urllib.urlencode(tmp)
+        #tmp = [( k, v.decode('utf-8').encode('1251') ) for k,v in query.items()]
+        #q = '?' + urllib.urlencode(tmp)
         
-        resp = self.opener.open(search_url+q)
+        #resp = self.opener.open(search_url+q)
         
-        return resp.read()
+        return data
         
     def _extract_text(self, tag):
         if tag.string: return [tag.string]
@@ -86,24 +124,17 @@ class Grabber:
             
             tr = i.findParent('tr')
             
-            iterator = 0
-            for td in tr.findAll(name = 'td', recursive = False):
-                text = ''.join(self._extract_text(td)).strip()
-                if iterator == 3:
-                    torrent['time'] = text
-                elif iterator == 4:
-                    torrent['size'] = text
-                elif iterator == 5:
-                    torrent['download'] = text
-                elif iterator == 6:
-                    torrent['sid'] = text
-                elif iterator == 7:
-                    torrent['pir'] = text
-                elif iterator == 8:
-                    torrent['author'] = text    
-                iterator = iterator + 1
-                
+            r = [''.join(self._extract_text(td)).strip() for td in tr.findAll(name = 'td', recursive = False)]
+
+            torrent['time'] = datetime_convert(r[3]).strftime("%a, %d %b %Y %H:%M {0}").format('+0500')
+            torrent['size'] = r[4]
+            torrent['download'] = r[5]
+            torrent['sid'] = r[6]
+            torrent['pir'] = r[7]
+            torrent['author'] = r[8]
+     
             result.append(torrent)
+            
         return result
 
     def to_rss(self, filename, title, desc, torrents):
@@ -132,10 +163,11 @@ class Grabber:
                 <link>http://alrock.ru/static/{1}.rss</link>
                 <description>{2}</description>
                 <language>ru-ru</language>
-                <pubDate>Tue, 18 Jan 2011 22:00:00 GMT</pubDate>
+                <pubDate>{3}</pubDate>
                 <generator>Python BeautifulSoup, Mechanize and hands 1.0</generator>
                 <webMaster>alexandrsk@gmail.com</webMaster>
-        """.format(title, filename, desc) + ''.join(items) + '</channel></rss>'
+        """.format(title, filename, desc, 
+                          datetime.datetime.now().strftime("%a, %d %b %Y %H:%M {0}").format('+0500')) + ''.join(items) + '</channel></rss>'
 
     def make_rss(self, filename, title, description, query):
         """
